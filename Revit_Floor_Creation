@@ -1,0 +1,617 @@
+from __future__ import division
+import clr
+import csv
+import re
+import sys
+import math
+import rpw
+import Autodesk
+import System
+
+clr.AddReference('RevitAPI')
+from Autodesk.Revit.DB import *
+from pyrevit import forms
+import Autodesk.Revit.UI.Selection
+from Autodesk.Revit.DB import Transaction
+from Autodesk.Revit.DB import SlabShapeVertex
+
+
+clr.AddReference('RevitAPIUI')
+from Autodesk.Revit.UI import *
+from Autodesk.Revit.DB import *
+from rpw.ui.forms import (Console, FlexForm, Label, ComboBox, TextBox, TextBox, CheckBox, Separator, Button,
+                          CommandLink, TaskDialog, select_file, SelectFromList, Alert)
+
+from pyrevit import revit, DB
+
+doc = __revit__.ActiveUIDocument.Document
+view = __revit__.ActiveUIDocument.ActiveView
+
+
+def Convert_M_To_FeetInch(num):
+    return UnitUtils.Convert(num, DisplayUnitType.DUT_METERS, DisplayUnitType.DUT_FEET_FRACTIONAL_INCHES)
+
+
+def Convert_FeetInch_To_M(num):
+    return UnitUtils.Convert(num, DisplayUnitType.DUT_FEET_FRACTIONAL_INCHES, DisplayUnitType.DUT_METERS)
+
+
+###################################################################################################################
+####################################################
+clr.AddReference('Microsoft.Office.Interop.Excel, Version=11.0.0.0, Culture=neutral, PublicKeyToken=71e9bce111e9429c')
+from Microsoft.Office.Interop import Excel
+from System.Runtime.InteropServices import Marshal
+
+####################################################
+# Getting the project base point coordinates
+collector = FilteredElementCollector(doc).OfClass(BasePoint).ToElements()
+EW = collector[1].get_Parameter(BuiltInParameter.BASEPOINT_EASTWEST_PARAM).AsDouble()
+NS = collector[1].get_Parameter(BuiltInParameter.BASEPOINT_NORTHSOUTH_PARAM).AsDouble()
+####################################################################################################################
+####################################################################################################################
+####################################################################################################################
+# Part 1
+# Read Polylines from CAD import
+
+__doc__ = 'Run the script then specify the thickness of each floor type. '\
+          'Floors will be created with their corresponding names and thicknesses. '\
+          'Then browse and select the csv file generated from Civil 3D '\
+          '\n'\
+          'N.B: You should check if all polylines are transformed into floors!'\
+          '\n\n'\
+          '#Copyright(c) 2020, Ali Safieddine - @DarBeirut'
+
+
+# Functions
+def Compare_points(p1, p2):
+    x1 = round(p1.X, 5)
+    y1 = round(p1.Y, 5)
+    z1 = round(p1.Z, 5)
+    x2 = round(p2.X, 5)
+    y2 = round(p2.Y, 5)
+    z2 = round(p2.Z, 5)
+    if x1 == x2 and y1 == y2 and z1 == z2:
+        return 1
+    else:
+        return 0
+def Compare_points2(p1, p2):
+    x1 = round(p1.X, 2)
+    y1 = round(p1.Y, 2)
+    z1 = round(p1.Z, 2)
+    x2 = round(p2.X, 2)
+    y2 = round(p2.Y, 2)
+    z2 = round(p2.Z, 2)
+    if x1 == x2 and y1 == y2 and z1 == z2:
+        return 1
+    else:
+        return 0
+def filter_by_Type(type, elements):
+    filteredElements = []
+    for elm in elements:
+        if elm.GetType().Name == type:
+            filteredElements.append(elm)
+    return filteredElements
+
+
+def toList(obj):
+    if hasattr(obj, '__iter__'):
+        return obj
+    else:
+        return [obj]
+
+
+def Create_Lines(Points):
+    i = 0
+    n = len(Points)
+    Lines = []
+    while i < n:
+        if i != n - 1:
+            if Compare_points2(Points[i],Points[i+1]) == 0:
+                Lines.append(Line.CreateBound(Points[i], Points[i + 1]))
+        i = i + 1
+    return Lines
+
+
+def Extract_polylines(Curves):
+    CurveList = []
+    CurveLayer = []
+    for curve in Curves:
+        linetype = curve.GetType()
+        if linetype == DB.Line or linetype == DB.Arc or linetype == DB.PolyLine:
+            graphicsStypeElm = doc.GetElement(curve.GraphicsStyleId)
+            ElmLayer = graphicsStypeElm.GraphicsStyleCategory.Name
+            curvetype = str(curve.GetType())
+            if curvetype == "Autodesk.Revit.DB.PolyLine":
+                PolylinePoints = curve.GetCoordinates()
+                Lines = Create_Lines(PolylinePoints)
+                for line in Lines:
+                    CurveList.append(line)
+                    CurveLayer.append(ElmLayer)
+            elif curvetype == "Autodesk.Revit.DB.Line" or curvetype == "Autodesk.Revit.DB.Arc":
+                CurveList.append(curve)
+                CurveLayer.append(ElmLayer)
+            else:
+                pass
+
+    return [CurveList, CurveLayer]
+
+
+########################################################
+# Functions for creating contiguous curves
+
+
+
+
+def Reverse_Curve(curve):
+    linetype = curve.GetType()
+    if linetype == DB.Line:
+        p1 = curve.GetEndPoint(0)
+        p2 = curve.GetEndPoint(1)
+        NewCurve = Line.CreateBound(p2, p1)
+    elif linetype == DB.Arc:
+        p1 = curve.GetEndPoint(0)
+        p2 = curve.Evaluate(0.5, True)
+        p3 = curve.GetEndPoint(1)
+        NewCurve = Arc.Create(p3, p1, p2)
+    else:
+        pass
+    return NewCurve
+
+
+def Replace_item_inList(List, old, new):
+    p1 = old[0]
+    p2 = old[-1]
+    NewList = List
+    i = 0
+    for l in NewList:
+        pt1 = l[0]
+        pt2 = l[-1]
+        if (Compare_points(p1, pt1) == 1 and Compare_points(p2, pt2) == 1) or (
+                Compare_points(p1, pt2) == 1 and Compare_points(p2, pt1) == 1):
+            NewList[i] = new
+        i = i + 1
+
+    return NewList
+
+
+def Create_Contiguous_Loop(Curves):
+
+    Points = []
+    for curve in Curves:
+        linetype = curve.GetType()
+        if linetype == DB.Line:
+            p1 = curve.GetEndPoint(0)
+            p2 = curve.GetEndPoint(1)
+            Points.append([p1, p2])
+        else:
+            p1 = curve.GetEndPoint(0)
+            p2 = curve.Evaluate(0.5, True)
+            p3 = curve.GetEndPoint(1)
+            Points.append([p1, p2, p3])
+
+    def Curve_Points(curve):
+
+        linetype = curve.GetType()
+        if linetype == DB.Line:
+            p1 = curve.GetEndPoint(0)
+            p2 = curve.GetEndPoint(1)
+            return [p1, p2]
+        else:
+            p1 = curve.GetEndPoint(0)
+            p2 = curve.Evaluate(0.5, True)
+            p3 = curve.GetEndPoint(1)
+            return [p1, p2, p3]
+    def List_None (List):
+        for l in List:
+            if l != None:
+                return False
+        return True
+    def First_item(List):
+        m=len(List)
+        j=0
+        while j<m:
+            if List[j] != None:
+                return [List[j],j]
+            j=j+1
+        return [None,None]
+
+    n = len(Points)
+    i = 0
+    MainPoint = Points[0]
+    tempPoints = []
+    for p in Points:
+        tempPoints.append(p)
+
+    MultipleContiguous = []
+
+    ContiguousCurves = []
+    while i < n - 1:
+        j = 0
+        index = First_item(tempPoints)[1]
+        if index == None:
+            break
+        if ContiguousCurves == []:
+            ContiguousCurves.append(Curves[index])
+            tempPoints[index] = None
+        while j < n:
+            MainPoint = Curve_Points(ContiguousCurves[-1])
+            temp = tempPoints[j]
+            if temp != None:
+                MainSP = MainPoint[0]
+                MainEP = MainPoint[-1]
+                tempSP = temp[0]
+                tempEP = temp[-1]
+
+                if Compare_points(MainEP, tempSP) == 1:
+                    ContiguousCurves.append(Curves[j])
+                    tempPoints[j] = None
+                elif Compare_points(MainEP, tempEP):
+                    ReversedCurve = Reverse_Curve(Curves[j])
+                    ContiguousCurves.append(ReversedCurve)
+                    tempPoints[j] = None
+            j = j + 1
+        if Compare_points(Curve_Points(ContiguousCurves[-1])[-1], Curve_Points(ContiguousCurves[0])[0]) == 1:
+            MultipleContiguous.append(ContiguousCurves)
+            ContiguousCurves = []
+
+        i = i + 1
+
+    return MultipleContiguous
+
+
+##########################################################################
+
+doc = __revit__.ActiveUIDocument.Document
+current_view = __revit__.ActiveUIDocument.ActiveView
+
+
+Selection = revit.get_selection()
+for sel in Selection:
+    LevelID = sel.LevelId
+    level = doc.GetElement(LevelID)
+    break
+
+FilteredCad = filter_by_Type("ImportInstance", Selection)
+if FilteredCad == []:
+    Alert('No CAD files were selected!')
+    sys.exit(0)
+elif len(FilteredCad) > 1:
+    Alert('Multiple elements were selected. Please select only 1 CAD file!')
+    sys.exit(0)
+
+CADFile = FilteredCad[0]
+CADGeometry = CADFile.get_Geometry(Options())
+
+OrganizedCurves = {}
+Layers = []
+for curve in CADGeometry:
+    CurveSymbol = curve.SymbolGeometry
+    ExtractedCurves = Extract_polylines(CurveSymbol)[0]
+    ElmLayer = Extract_polylines(CurveSymbol)[1]
+    k = 0
+    m = len(ExtractedCurves)
+    while k < m:
+        sym = ExtractedCurves[k]
+        layer = ElmLayer[k]
+        if "slab" in layer:
+            CurvesDic = {}
+            Curves = []
+            CurvesIn = []
+            CurvesOut = []
+            EndIndex = layer.find("slab")
+            KeyLayer = layer[:EndIndex - 1]
+            if KeyLayer not in Layers:
+                Layers.append(KeyLayer)
+            d1 = layer[EndIndex + 5]
+            try:
+                d2 = layer[EndIndex + 6]
+                int(d2)
+            except:
+                d2 = ''
+            try:
+                d3 = layer[EndIndex + 7]
+                int(d3)
+            except:
+                d3 = ''
+            SlabNumber = int(d1 + d2 + d3)
+            LayerType = layer[-5:]
+            if KeyLayer not in OrganizedCurves:
+                if LayerType == "OUTER":
+                    CurvesOut.append(sym)
+                else:
+                    CurvesIn.append(sym)
+                Curves.append(CurvesOut)
+                Curves.append(CurvesIn)
+                CurvesDic[SlabNumber] = Curves
+                OrganizedCurves[KeyLayer] = CurvesDic
+            else:
+                if SlabNumber not in OrganizedCurves[KeyLayer]:
+                    if LayerType == "OUTER":
+                        CurvesOut.append(sym)
+                    else:
+                        CurvesIn.append(sym)
+                    Curves.append(CurvesOut)
+                    Curves.append(CurvesIn)
+                    OrganizedCurves[KeyLayer][SlabNumber] = Curves
+                else:
+                    if LayerType == "OUTER":
+                        OrganizedCurves[KeyLayer][SlabNumber][0].append(sym)
+                    else:
+                        OrganizedCurves[KeyLayer][SlabNumber][1].append(sym)
+        k = k + 1
+
+
+
+#################################################################################################################################
+# Part 2: Floor Thickness User Input
+
+components = [Label('Floor Layers'),
+              Separator(),
+              Label('Fill Floor Thickness(m):')]
+i = 1
+for layer in Layers:
+    components.append(Label(layer))
+    components.append(TextBox("Layer" + str(i), Text='0.2'))
+    components.append(Separator())
+    i = i + 1
+components.append(Button('Next'))
+form = FlexForm("Floor Thickness", components)
+form.show()
+# Input Results
+LayerTh = {}
+i = 1
+for layer in Layers:
+    Th = float(form.values["Layer" + str(i)])
+    LayerTh[layer] = Th
+    i = i + 1
+
+####################################################################################################################
+# Part 3A: Creating Floor Types
+UIunit = Document.GetUnits(doc).GetFormatOptions(UnitType.UT_Length).DisplayUnits
+
+Collector = FilteredElementCollector(doc).OfCategory(BuiltInCategory.OST_Floors).ToElements()
+elements = toList(Collector)
+MStructure = elements[0].GetCompoundStructure()
+DMaterial = doc.GetElement(MStructure.GetMaterialId(0))
+newfamTypeNames = Layers
+
+widths = []
+functions = []
+for layer in Layers:
+    w = LayerTh[layer]
+    widths.append(w)
+    functions.append("Structure")
+exterior = 0
+interior = 0
+
+t = Transaction(doc, "Create Floor Types ")
+t = Transaction(doc, "Create Floor Types ")
+t.Start()
+AllFloorTypes = []
+i = 0
+
+for newfamTypeName in  newfamTypeNames:
+    elem = elements[0]
+    if isinstance(elem, Autodesk.Revit.DB.ElementType):
+        famType = elem
+
+    elif elem.ToString() == 'Autodesk.Revit.DB.Floor':
+        famType = elem.FloorType
+
+    else:
+        pass
+    try:
+        newfamType = famType.Duplicate(newfamTypeName)
+    except:
+        pass
+    layers = []
+    width = widths[i]
+    function = functions[i]
+    if isinstance(function, Autodesk.Revit.DB.MaterialFunctionAssignment):
+        layerFunction = function
+    else:
+        layerFunction = System.Enum.Parse(Autodesk.Revit.DB.MaterialFunctionAssignment, function)
+    layers.append(CompoundStructureLayer())
+    compound = CompoundStructure.CreateSimpleCompoundStructure(layers)
+    compound.SetNumberOfShellLayers(ShellLayerType.Exterior, exterior)
+    compound.SetNumberOfShellLayers(ShellLayerType.Interior, interior)
+    i = i + 1
+    try:
+        newfamType.SetCompoundStructure(compound)
+    except:
+        pass
+
+t.Commit()
+NewCollector = FilteredElementCollector(doc).OfCategory(BuiltInCategory.OST_Floors).ToElements()
+AllFloorTypes = toList(NewCollector)
+AllFloorTypesDic = {}
+
+for typ in AllFloorTypes:
+    name = typ.LookupParameter("Type Name").AsString()
+    AllFloorTypesDic[name] = typ
+
+# Part 3B: Creating Floors
+t = Transaction(doc, "Create Floors")
+t.Start()
+normal = XYZ.BasisZ
+total = 0
+CreatedFloors = []
+
+
+for layer in Layers:
+    CurveSubDic = OrganizedCurves[layer]
+    for key in CurveSubDic:
+        FloorCurves = CurveSubDic[key][0]
+        curveArray = CurveArray()
+        try:
+            NewCurves = Create_Contiguous_Loop(FloorCurves)[0]
+        except: NewCurves = []
+
+        for curve in NewCurves:
+            curveArray.Append(curve)
+
+
+
+        # try:
+        #     floorType = AllFloorTypesDic[layer]
+        #     NewFloor = doc.Create.NewFloor(curveArray, floorType, level, False, normal)
+        #     CurveSubDic[key].append(NewFloor)
+        #     CreatedFloors.append(NewFloor)
+        #
+        # except:
+        #     CurveSubDic[key].append(None)
+        floorType = AllFloorTypesDic[layer]
+        #print(layer)
+        #print(key)
+        NewFloor = doc.Create.NewFloor(curveArray, floorType, level, False, normal)
+        CurveSubDic[key].append(NewFloor)
+        CreatedFloors.append(NewFloor)
+
+t.Commit()
+
+
+####################################################################################################################
+#################################################################################
+# Part 3C: Creating Openings
+
+t = Transaction(doc, "Create Floor Openings ")
+t.Start()
+
+for layer in Layers:
+    CurveSubDic = OrganizedCurves[layer]
+
+
+    for key in CurveSubDic:
+
+        OpeningCurves = CurveSubDic[key][1]
+        n = len(OpeningCurves)
+        if n != 0:
+            NewCurves = Create_Contiguous_Loop(OpeningCurves)
+            FloorInstance = CurveSubDic[key][2]
+            for curveList in NewCurves:
+                curveOpening = CurveLoop()
+                NewCurveOpening = CurveArray()
+                for curve in curveList:
+                    curveOpening.Append(curve)
+                print(layer)
+                print(key)
+                OffsetCurves = CurveLoop.CreateViaOffset(curveOpening, -0.005, normal)
+
+                for c in OffsetCurves:
+                    NewCurveOpening.Append(c)
+                if FloorInstance != None:
+                    Opening = doc.Create.NewOpening(FloorInstance, NewCurveOpening, True)
+
+
+t.Commit()
+####################################################################################
+# Part 4: Modify Sub Element
+# Select Text file to import Points
+commands = [CommandLink('Browse', return_value='Open')]
+dialog = TaskDialog('Select Excel File ')
+dialog.AddCommandLink(TaskDialogCommandLinkId.CommandLink1, "Browse")
+dialog.CommonButtons = TaskDialogCommonButtons.Close
+dialog.DefaultButton = TaskDialogResult.Close
+tResult = dialog.Show()
+if TaskDialogResult.CommandLink1 == tResult:
+    path = select_file('csv (*.csv)|*.csv')
+f = open(path, "r")
+contents = csv.reader(f, delimiter=',')
+KeyLayer = None
+SlabNumber = None
+for layer in Layers:
+    SubDic = OrganizedCurves[layer]
+
+    for key in SubDic:
+
+        SubDic[key].append([])
+
+
+j=0
+for elm in contents:
+    j=j+1
+    try:
+        temp = float(elm[0])
+        if KeyLayer != None and SlabNumber != None:
+            point = XYZ(Convert_M_To_FeetInch(float(elm[0])) - EW, Convert_M_To_FeetInch(float(elm[1])) - NS,
+                        Convert_M_To_FeetInch(float(elm[2])))
+            OrganizedCurves[KeyLayer][SlabNumber][3].append(point)
+    except:
+        layer = elm[0]
+        if "slab" in layer:
+            EndIndex = layer.find("slab")
+            KeyLayer = layer[:EndIndex - 1]
+            d1 = layer[EndIndex + 5]
+            try:
+                d2 = layer[EndIndex + 6]
+                int(d2)
+            except:
+                d2 = ''
+            try:
+                d3 = layer[EndIndex + 7]
+                int(d3)
+            except:
+                d3 = ''
+            SlabNumber = int(d1 + d2 + d3)
+
+def tolist(obj1):
+    if hasattr(obj1, "__iter__"):
+        return obj1
+    else:
+        return [obj1]
+
+
+def AddPointToSlabShape(item, point):
+    if hasattr(item, "SlabShapeEditor"):
+        if point.Z == 0:
+            print("Z = 0")
+        try:
+            item.SlabShapeEditor.DrawPoint(point)
+            return True
+        except:
+            return False
+    else:
+        return False
+
+def tolist(obj):
+    if hasattr(obj,"--iter--"):
+        return obj
+    else:
+        return [obj]
+
+t = Transaction(doc, "Modify sub element ")
+t.Start()
+j = 0
+for layer in Layers:
+    SubDic = OrganizedCurves[layer]
+
+    for key in SubDic:
+
+        FloorIns = SubDic[key][2]
+        Points = SubDic[key][3]
+        j=j+1
+
+
+        ZAverage = 0
+        for pt in Points:
+            bool = AddPointToSlabShape(FloorIns, pt)
+            j = j + 1
+            ZAverage = ZAverage + pt.Z
+
+        try:
+            ZAverage = ZAverage/len(Points)
+        except: pass
+
+        try:
+            FloorPoints = FloorIns.SlabShapeEditor.SlabShapeVertices
+        except:
+            FloorPoints = []
+        for pt in FloorPoints:
+            point = pt.Position
+            if point.Z < 0.1:
+                NewPt = XYZ(point.X,point.Y,ZAverage)
+                AddPointToSlabShape(FloorIns,NewPt)
+
+
+
+t.Commit()
